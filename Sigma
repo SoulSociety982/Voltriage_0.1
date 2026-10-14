@@ -1,0 +1,303 @@
+local Players = game:GetService("Players")
+local Storage = game:GetService("ReplicatedStorage")
+local Run = game:GetService("RunService")
+local Http = game:GetService("HttpService")
+
+assert(Run:IsServer(), "ServerParryAnimation must run on server")
+
+local Module = {}
+Module.__index = Module
+
+local Ids = {
+	Parry = "rbxassetid://14556917319",
+	SuccessParry = "rbxassetid://14556917319",
+	SuccessParry1 = "rbxassetid://14556917319",
+	SuccessParry2 = "rbxassetid://140460100779318",
+	SuccessParry3 = "rbxassetid://16492125583",
+	SuccessParry4 = "rbxassetid://15191275110",
+	GrabParry = "rbxassetid://92506027817347",
+}
+
+local Map = {
+	Default = 3,
+	Dual = 2,
+	Scissors = 4,
+	Katana = 3,
+	Greatsword = 2,
+}
+
+local Priority = Enum.AnimationPriority.Action4
+local Fade = 0
+
+local function Ensure(Char)
+	local Hum = Char:FindFirstChildOfClass("Humanoid")
+	if not Hum then return nil end
+	local Anim = Hum:FindFirstChildOfClass("Animator")
+	if not Anim then
+		Anim = Instance.new("Animator")
+		Anim.Parent = Hum
+	end
+	return Anim, Hum
+end
+
+local function Variants(Char, Type, Sword)
+	local Key = Sword or Type or Char:GetAttribute("SwordType") or Char:GetAttribute("AnimationType") or "Default"
+	return Map[Key] or Map.Default
+end
+
+local function Build(Char, Type, Sword)
+	local Count = Variants(Char, Type, Sword)
+	local Server = (Char:GetAttribute("ServerParryCount") or 0)
+	local List = {"Parry", "SuccessParry"}
+	if Count and Count > 0 then
+		local Index = (Server % Count) + 1
+		List[2] = ("SuccessParry%d"):format(Index)
+	end
+	return List
+end
+
+local function Create(Id)
+	local Anim = Instance.new("Animation")
+	Anim.AnimationId = Id
+	return Anim
+end
+
+function Module.new()
+	local Self = setmetatable({
+		_tracks = {},
+		_connections = {},
+		_bindables = {},
+		_characterHooks = {},
+	}, Module)
+	return Self
+end
+
+function Module:Destroy()
+	for _, Tracks in pairs(self._tracks) do
+		for _, Track in pairs(Tracks) do
+			if Track and Track.IsPlaying then
+				pcall(function() Track:Stop(0) end)
+			end
+			if Track then
+				pcall(function() Track:Destroy() end)
+			end
+		end
+	end
+	table.clear(self._tracks)
+	for _, Conn in pairs(self._connections) do
+		if Conn and Conn.Connected then
+			Conn:Disconnect()
+		end
+	end
+	table.clear(self._connections)
+	for _, Bind in pairs(self._bindables) do
+		if Bind and Bind.Parent then
+			Bind:Destroy()
+		end
+	end
+	table.clear(self._bindables)
+	table.clear(self._characterHooks)
+end
+
+function Module:_trackKey(Char)
+	return tostring(Char)
+end
+
+function Module:_cleanTracks(Char)
+	local Key = self:_trackKey(Char)
+	local Tracks = self._tracks[Key]
+	if not Tracks then return end
+	for _, Track in pairs(Tracks) do
+		if Track then
+			pcall(function()
+				if Track.IsPlaying then Track:Stop(0) end
+				Track:Destroy()
+			end)
+		end
+	end
+	self._tracks[Key] = nil
+end
+
+function Module:Play(Char, Data)
+	if typeof(Char) ~= "Instance" or not Char:IsA("Model") then
+		return nil
+	end
+	local Anim, Hum = Ensure(Char)
+	if not Anim or not Hum or Hum.Health <= 0 then
+		return nil
+	end
+
+	self:_cleanTracks(Char)
+
+	local Type = (Data and Data.AnimationType)
+		or Char:GetAttribute("AnimationType")
+		or "Default"
+	local Sword = (Data and Data.SwordType)
+		or Char:GetAttribute("SwordType")
+		or "Default"
+	local Slash = (Data and Data.SlashName)
+		or Char:GetAttribute("SlashName")
+		or "SlashEffect"
+	local SwordId = (Data and Data.Id)
+		or Char:GetAttribute("Slash")
+		or Char:GetAttribute("EquippedSword")
+
+	local Current = Char:GetAttribute("ServerParryCount") or 0
+	local Next = Current + 1
+	Char:SetAttribute("ServerParryCount", Next)
+
+	local List = Build(Char, Type, Sword)
+	local Loaded = {}
+	local Key = self:_trackKey(Char)
+	self._tracks[Key] = Loaded
+
+	for _, Name in ipairs(List) do
+		local Id = Ids[Name] or Ids.SuccessParry
+		local Inst = Create(Id)
+		local Ok, Track = pcall(function()
+			return Anim:LoadAnimation(Inst)
+		end)
+		if Ok and Track then
+			Track.Looped = false
+			Track.Priority = Priority
+			table.insert(Loaded, Track)
+			Track:Play(Fade)
+		end
+		Inst:Destroy()
+	end
+
+	local Origin = Char:FindFirstChild("SlashOrigin")
+		or Char:FindFirstChild("Torso")
+		or Char:FindFirstChild("UpperTorso")
+		or Char.PrimaryPart
+
+	local Remotes = Storage:FindFirstChild("Remotes")
+	if Remotes then
+		local Event = Remotes:FindFirstChild("ParrySuccessClient")
+		if Event then
+			if Event:IsA("BindableEvent") then
+				Event:Fire(Slash, Origin, SwordId)
+			elseif Event:IsA("RemoteEvent") then
+				Event:FireAllClients(Slash, Origin, SwordId)
+			end
+		end
+	end
+
+	return Loaded
+end
+
+function Module:PlayFromBall(Char)
+	return self:Play(Char, {
+		AnimationType = Char:GetAttribute("AnimationType") or "Default",
+		SwordType = Char:GetAttribute("SwordType") or "Default",
+		SlashName = Char:GetAttribute("SlashName"),
+		Id = Char:GetAttribute("Slash") or Char:GetAttribute("EquippedSword"),
+	})
+end
+
+function Module:_ensureBindable(Char)
+	local Existing = Char:FindFirstChild("Parry")
+	if Existing and Existing:IsA("BindableFunction") then
+		return Existing
+	end
+	local Bind = Instance.new("BindableFunction")
+	Bind.Name = "Parry"
+	Bind.Parent = Char
+	self._bindables[self:_trackKey(Char)] = Bind
+	return Bind
+end
+
+function Module:HookCharacter(Char)
+	if not Char or self._characterHooks[Char] then return end
+	self._characterHooks[Char] = true
+
+	local Bind = self:_ensureBindable(Char)
+	local Conn = Bind.OnInvoke:Connect(function()
+		self:PlayFromBall(Char)
+	end)
+	table.insert(self._connections, Conn)
+
+	if not Char:GetAttribute("ServerParryCount") then
+		Char:SetAttribute("ServerParryCount", 0)
+	end
+
+	local Hum = Char:FindFirstChildOfClass("Humanoid")
+	if Hum then
+		local Died = Hum.Died:Connect(function()
+			self:_cleanTracks(Char)
+			self._characterHooks[Char] = nil
+		end)
+		table.insert(self._connections, Died)
+	end
+
+	local Ancestry = Char.AncestryChanged:Connect(function(_, Parent)
+		if not Parent then
+			self:_cleanTracks(Char)
+			self._characterHooks[Char] = nil
+		end
+	end)
+	table.insert(self._connections, Ancestry)
+end
+
+function Module:HookPlayer(Player)
+	local function OnChar(Char)
+		if Char then
+			task.defer(function()
+				self:HookCharacter(Char)
+			end)
+		end
+	end
+	if Player.Character then
+		OnChar(Player.Character)
+	end
+	local Conn = Player.CharacterAdded:Connect(OnChar)
+	table.insert(self._connections, Conn)
+end
+
+function Module:Init()
+	for _, Player in ipairs(Players:GetPlayers()) do
+		self:HookPlayer(Player)
+	end
+	local Conn = Players.PlayerAdded:Connect(function(Player)
+		self:HookPlayer(Player)
+	end)
+	table.insert(self._connections, Conn)
+end
+
+local function Setup()
+	local Folder = Storage:FindFirstChild("Remotes")
+	if not Folder then
+		Folder = Instance.new("Folder")
+		Folder.Name = "Remotes"
+		Folder.Parent = Storage
+	end
+
+	local Attempt = Folder:FindFirstChild("ParryAttempt")
+	if not Attempt then
+		Attempt = Instance.new("RemoteEvent")
+		Attempt.Name = "ParryAttempt"
+		Attempt.Parent = Folder
+	end
+
+	local Success = Folder:FindFirstChild("ParrySuccessClient")
+	if not Success then
+		Success = Instance.new("BindableEvent")
+		Success.Name = "ParrySuccessClient"
+		Success.Parent = Folder
+	end
+
+	return Attempt, Success
+end
+
+local Single = Module.new()
+
+local Remote = Setup()
+Remote.OnServerEvent:Connect(function(Player)
+	local Char = Player.Character
+	if not Char then return end
+	local Hum = Char:FindFirstChildOfClass("Humanoid")
+	if not Hum or Hum.Health <= 0 then return end
+	Single:PlayFromBall(Char)
+end)
+
+Single:Init()
